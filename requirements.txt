@@ -1,3 +1,7 @@
 telethon
 aiohttp
 asyncio
+python-dotenv
+neo4j
+openai-whisper
+ffmpeg-python
