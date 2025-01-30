@@ -1,16 +1,17 @@
 import os
-import sqlite3
-import json
-import csv
-import asyncio
-from telethon import TelegramClient
-from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument, User, PeerChannel
-from telethon.errors import FloodWaitError, RPCError
-import aiohttp
 import sys
-from neo4j import GraphDatabase
+import json
+import sqlite3
+import asyncio
 import whisper
-import ffmpeg
+import logging
+import numpy as np
+from datetime import datetime
+from telethon import TelegramClient, events
+from telethon.tl.types import PeerChannel, MessageMediaDocument, MessageMediaPhoto
+import imageio_ffmpeg
+import soundfile as sf
+from neo4j import GraphDatabase
 
 def display_ascii_art():
     WHITE = "\033[97m"
@@ -120,7 +121,11 @@ client = TelegramClient('session', state['api_id'], state['api_hash'])
 
 async def save_message_to_db(message, channel_id, media_path=None):
     """Save message and its comments to the database"""
-    conn = sqlite3.connect(os.path.join(os.getcwd(), str(channel_id), f'{channel_id}.db'))
+    # Create channel directory if it doesn't exist
+    channel_dir = os.path.join(os.getcwd(), str(channel_id))
+    os.makedirs(channel_dir, exist_ok=True)
+    
+    conn = sqlite3.connect(os.path.join(channel_dir, f'{channel_id}.db'))
     c = conn.cursor()
     
     # Create messages table if not exists
@@ -145,6 +150,21 @@ async def save_message_to_db(message, channel_id, media_path=None):
             elif hasattr(message.media.document, 'mime_type'):
                 mime_type = message.media.document.mime_type
     
+    # Get sender information safely
+    sender_id = None
+    first_name = None
+    last_name = None
+    username = None
+    
+    if message.sender:
+        sender_id = message.sender_id
+        if hasattr(message.sender, 'first_name'):
+            first_name = message.sender.first_name
+        if hasattr(message.sender, 'last_name'):
+            last_name = message.sender.last_name
+        if hasattr(message.sender, 'username'):
+            username = message.sender.username
+    
     # Save the message with ISO format date
     c.execute('''INSERT OR IGNORE INTO messages 
                  (message_id, date, sender_id, first_name, last_name, username, 
@@ -152,10 +172,10 @@ async def save_message_to_db(message, channel_id, media_path=None):
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
               (message.id, 
                message.date.isoformat(), 
-               message.sender_id,
-               message.sender.first_name if message.sender else None,
-               message.sender.last_name if message.sender else None,
-               message.sender.username if message.sender else None,
+               sender_id,
+               first_name,
+               last_name,
+               username,
                message.message, 
                message.media.__class__.__name__ if message.media else None, 
                media_path,
@@ -172,10 +192,10 @@ async def save_message_to_db(message, channel_id, media_path=None):
                   (message.id,
                    message.reply_to_msg_id,
                    message.date.isoformat(),
-                   message.sender_id,
-                   message.sender.first_name if message.sender else None,
-                   message.sender.last_name if message.sender else None,
-                   message.sender.username if message.sender else None,
+                   sender_id,
+                   first_name,
+                   last_name,
+                   username,
                    message.message))
     
     conn.commit()
@@ -183,48 +203,30 @@ async def save_message_to_db(message, channel_id, media_path=None):
 
 MAX_RETRIES = 5
 
-async def download_media(channel, message):
-    if not message.media or not state['scrape_media']:
-        return None
-
-    channel_dir = os.path.join(os.getcwd(), channel)
-    media_folder = os.path.join(channel_dir, 'media')
-    os.makedirs(media_folder, exist_ok=True)    
-    media_file_name = None
-    if isinstance(message.media, MessageMediaPhoto):
-        media_file_name = message.file.name or f"{message.id}.jpg"
-    elif isinstance(message.media, MessageMediaDocument):
-        media_file_name = message.file.name or f"{message.id}.{message.file.ext if message.file.ext else 'bin'}"
-    
-    if not media_file_name:
-        print(f"Unable to determine file name for message {message.id}. Skipping download.")
+async def download_media(channel_id, message):
+    """Download media from a message"""
+    if not message.media:
         return None
     
-    media_path = os.path.join(media_folder, media_file_name)
-    
-    if os.path.exists(media_path):
-        print(f"Media file already exists: {media_path}")
-        return media_path
+    try:
+        # Create channel and media directories if they don't exist
+        channel_dir = os.path.join(os.getcwd(), str(channel_id))
+        media_dir = os.path.join(channel_dir, 'media')
+        os.makedirs(media_dir, exist_ok=True)
+        
+        # Download the media
+        path = await client.download_media(message, file=media_dir)
+        if path:
+            # Return just the filename, not the full path
+            return os.path.basename(path)
+        return None
+    except Exception as e:
+        print(f"Error downloading media: {e}")
+        return None
 
-    retries = 0
-    while retries < MAX_RETRIES:
-        try:
-            if isinstance(message.media, MessageMediaPhoto):
-                media_path = await message.download_media(file=media_folder)
-            elif isinstance(message.media, MessageMediaDocument):
-                media_path = await message.download_media(file=media_folder)
-            if media_path:
-                print(f"Successfully downloaded media to: {media_path}")
-            break
-        except (TimeoutError, aiohttp.ClientError, RPCError) as e:
-            retries += 1
-            print(f"Retrying download for message {message.id}. Attempt {retries}...")
-            await asyncio.sleep(2 ** retries)
-    return media_path
-
-async def rescrape_media(channel):
-    channel_dir = os.path.join(os.getcwd(), channel)
-    db_file = os.path.join(channel_dir, f'{channel}.db')
+async def rescrape_media(channel_id):
+    channel_dir = os.path.join(os.getcwd(), channel_id)
+    db_file = os.path.join(channel_dir, f'{channel_id}.db')
     conn = sqlite3.connect(db_file)
     c = conn.cursor()
     c.execute('SELECT message_id FROM messages WHERE media_type IS NOT NULL AND media_path IS NULL')
@@ -233,14 +235,14 @@ async def rescrape_media(channel):
 
     total_messages = len(rows)
     if total_messages == 0:
-        print(f"No media files to reprocess for channel {channel}.")
+        print(f"No media files to reprocess for channel {channel_id}.")
         return
 
     for index, (message_id,) in enumerate(rows):
         try:
-            entity = await client.get_entity(PeerChannel(int(channel)))
+            entity = await client.get_entity(PeerChannel(int(channel_id)))
             message = await client.get_messages(entity, ids=message_id)
-            media_path = await download_media(channel, message)
+            media_path = await download_media(channel_id, message)
             if media_path:
                 conn = sqlite3.connect(db_file)
                 c = conn.cursor()
@@ -249,7 +251,7 @@ async def rescrape_media(channel):
                 conn.close()
             
             progress = (index + 1) / total_messages * 100
-            sys.stdout.write(f"\rReprocessing media for channel {channel}: {progress:.2f}% complete")
+            sys.stdout.write(f"\rReprocessing media for channel {channel_id}: {progress:.2f}% complete")
             sys.stdout.flush()
         except Exception as e:
             print(f"Error reprocessing message {message_id}: {e}")
@@ -405,50 +407,53 @@ async def export_data():
         await export_to_json(channel)
         print(f"Exported data for {channel} to CSV and JSON files")
 
-async def export_to_csv(channel):
-    channel_dir = os.path.join(os.getcwd(), channel)
-    db_file = os.path.join(channel_dir, f'{channel}.db')
-    csv_file = os.path.join(channel_dir, f'{channel}.csv')
-    
-    if not os.path.exists(db_file):
-        print(f"No database file found for channel {channel}")
-        return
-        
+async def export_to_csv(channel_id):
+    """Export messages and comments to CSV files"""
     try:
+        channel_dir = os.path.join(os.getcwd(), str(channel_id))
+        db_file = os.path.join(channel_dir, f'{channel_id}.db')
+        
+        if not os.path.exists(db_file):
+            print(f"No database file found for channel {channel_id}")
+            return
+        
         conn = sqlite3.connect(db_file)
         c = conn.cursor()
         
         # Export messages
-        c.execute('SELECT * FROM messages')
-        rows = c.fetchall()
+        output_file = os.path.join(channel_dir, f'{channel_id}_messages.csv')
+        c.execute('''SELECT message_id, date, message, media_type, media_path, mime_type, transcript
+                    FROM messages''')
         
-        with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+        with open(output_file, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow([description[0] for description in c.description])
-            writer.writerows(rows)
-            
-        # Export comments to a separate CSV
-        comments_csv_file = os.path.join(channel_dir, f'{channel}_comments.csv')
+            writer.writerow(['Message ID', 'Date', 'Message', 'Media Type', 'Media Path', 'MIME Type', 'Transcript'])
+            writer.writerows(c.fetchall())
+        
+        print(f"Messages exported to {output_file}")
+        
+        # Export comments
+        output_file = os.path.join(channel_dir, f'{channel_id}_comments.csv')
         c.execute('SELECT * FROM comments')
-        comment_rows = c.fetchall()
         
-        with open(comments_csv_file, 'w', newline='', encoding='utf-8') as f:
+        with open(output_file, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([description[0] for description in c.description])
-            writer.writerows(comment_rows)
-            
+            writer.writerows(c.fetchall())
+        
+        print(f"Comments exported to {output_file}")
         conn.close()
-        print(f"CSV export completed for {channel}")
+        
     except Exception as e:
-        print(f"Error exporting to CSV for channel {channel}: {e}")
+        print(f"Error exporting to CSV: {str(e)}")
 
-async def export_to_json(channel):
-    channel_dir = os.path.join(os.getcwd(), channel)
-    db_file = os.path.join(channel_dir, f'{channel}.db')
-    json_file = os.path.join(channel_dir, f'{channel}.json')
+async def export_to_json(channel_id):
+    channel_dir = os.path.join(os.getcwd(), channel_id)
+    db_file = os.path.join(channel_dir, f'{channel_id}.db')
+    json_file = os.path.join(channel_dir, f'{channel_id}.json')
     
     if not os.path.exists(db_file):
-        print(f"No database file found for channel {channel}")
+        print(f"No database file found for channel {channel_id}")
         return
         
     try:
@@ -467,7 +472,7 @@ async def export_to_json(channel):
         
         # Combine data
         data = {
-            'channel': channel,
+            'channel': channel_id,
             'messages': messages,
             'comments': comments
         }
@@ -476,9 +481,9 @@ async def export_to_json(channel):
             json.dump(data, f, ensure_ascii=False, indent=4)
             
         conn.close()
-        print(f"JSON export completed for {channel}")
+        print(f"JSON export completed for {channel_id}")
     except Exception as e:
-        print(f"Error exporting to JSON for channel {channel}: {e}")
+        print(f"Error exporting to JSON for channel {channel_id}: {e}")
 
 async def view_channels():
     """View detailed information about saved channels including message and media stats"""
@@ -631,12 +636,22 @@ async def manage_channels():
             
         elif choice == 'N':
             print("\nConnecting to Neo4j...")
-            driver = setup_neo4j_connection()
-            if driver:
+            if await setup_neo4j_connection():
+                # Get list of channels
+                print("\nSaved channels:")
+                channels = list(state.get('channels', {}).keys())
+                for i, channel in enumerate(channels, 1):
+                    title = state.get('channel_details', {}).get(channel, {}).get('title', 'Unknown')
+                    print(f"{i}. {title} (ID: {channel})")
+                
+                # Get channel selection
+                choice = input("\nEnter a number to upload that channel, or any other input to return to menu.\nChannel number to process (or other input to cancel): ")
                 try:
-                    await upload_to_neo4j(driver)
-                finally:
-                    driver.close()
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(channels):
+                        await upload_to_neo4j(channels[idx])
+                except ValueError:
+                    print("Returning to menu...")
             
         elif choice == 'R':
             channels = await list_saved_channels()
@@ -715,207 +730,175 @@ async def main_menu():
         else:
             print("Invalid choice. Please try again.")
 
-def setup_neo4j_connection():
-    """Set up connection to Neo4j database"""
-    if state.get('neo4j', {}).get('url') and state['neo4j'].get('password'):
-        return try_neo4j_connection(
-            state['neo4j']['url'],
-            state['neo4j']['password'],
-            state['neo4j'].get('database', 'neo4j')
-        )
-    
-    db_type = input("Connect to Local [L] or Remote [R] Neo4j database? ").lower()
-    while db_type not in ['l', 'r']:
-        db_type = input("Please enter L for Local or R for Remote: ").lower()
-    
-    database = input("Enter database name (press Enter for 'neo4j'): ").strip()
-    if not database:
-        database = 'neo4j'
-    
-    if db_type == 'l':
-        url = "bolt://localhost:7687"
-        password = input("Enter database password: ")
-    else:
-        url = input("Enter full database URL (e.g., bolt://example.com:7687): ")
-        password = input("Enter database password: ")
-    
-    # Save to state
-    state['neo4j'] = {
-        'type': 'local' if db_type == 'l' else 'remote',
-        'url': url,
-        'database': database,
-        'password': password
-    }
-    save_state(state)
-    
-    return try_neo4j_connection(url, password, database)
-
-def try_neo4j_connection(url, password, database):
-    """Test Neo4j connection and return driver if successful"""
+async def upload_to_neo4j(channel_id):
+    """Upload channel data to Neo4j"""
     try:
+        neo4j_config = state.get('neo4j', {})
+        if not neo4j_config or not neo4j_config.get('url') or not neo4j_config.get('password'):
+            print("Neo4j connection details not found in state.json")
+            return
+
+        channel_dir = os.path.join(os.getcwd(), str(channel_id))
+        db_file = os.path.join(channel_dir, f'{channel_id}.db')
+        
+        if not os.path.exists(db_file):
+            print(f"No database file found for channel {channel_id}")
+            return
+            
+        # Connect to Neo4j
+        driver = GraphDatabase.driver(
+            neo4j_config['url'],
+            auth=("neo4j", neo4j_config['password'])
+        )
+        
+        # Connect to SQLite
+        conn = sqlite3.connect(db_file)
+        c = conn.cursor()
+        
+        with driver.session() as session:
+            # Create Channel node
+            session.run("""
+                MERGE (c:Channel {id: $channel_id})
+                SET c.channel_id = $channel_id
+            """, channel_id=str(channel_id))
+            
+            # Get table structure
+            c.execute("PRAGMA table_info(messages)")
+            columns = [col[1] for col in c.fetchall()]
+            print("Available columns:", columns)
+            
+            # Get and create Message nodes with Media and Transcript relationships
+            c.execute('''SELECT message_id, date, message, media_type, media_path, mime_type, transcript 
+                        FROM messages''')
+            messages = c.fetchall()
+            
+            for msg in messages:
+                msg_id, date, message_text, media_type, media_path, mime_type, transcript = msg
+                
+                # Create Message node
+                session.run("""
+                    MERGE (m:Message {id: $msg_id})
+                    SET m.date = $date,
+                        m.text = $message_text
+                    WITH m
+                    MATCH (c:Channel {id: $channel_id})
+                    MERGE (c)-[:HAS_MESSAGE]->(m)
+                """, msg_id=str(msg_id), date=date, message_text=message_text, channel_id=str(channel_id))
+                
+                # If there's media, create Media node
+                if media_path:
+                    # Create hash from media path for unique ID
+                    import hashlib
+                    media_hash = hashlib.md5(media_path.encode()).hexdigest()
+                    
+                    # Get absolute path for file:/// URL
+                    abs_path = os.path.abspath(os.path.join(channel_dir, 'media', media_path))
+                    file_url = f"file:///{abs_path.replace(os.sep, '/')}"
+                    
+                    # Create Media node with appropriate properties
+                    media_props = {
+                        'id': media_hash,
+                        'type': media_type,
+                        'mime_type': mime_type,
+                        'path': media_path
+                    }
+                    
+                    # Add thumbnail for images
+                    if mime_type and mime_type.startswith('image/'):
+                        media_props['thumbnail'] = file_url
+                    
+                    session.run("""
+                        MERGE (media:Media {id: $id})
+                        SET media += $props
+                        WITH media
+                        MATCH (m:Message {id: $msg_id})
+                        MERGE (m)-[:HAS_MEDIA]->(media)
+                    """, id=media_hash, props=media_props, msg_id=str(msg_id))
+                    
+                    # If there's a transcript, create Transcript node
+                    if transcript:
+                        transcript_hash = hashlib.md5(f"{media_hash}_transcript".encode()).hexdigest()
+                        
+                        session.run("""
+                            MERGE (t:Transcript {id: $id})
+                            SET t.text = $text
+                            WITH t
+                            MATCH (media:Media {id: $media_id})
+                            MERGE (media)-[:HAS_TRANSCRIPT]->(t)
+                        """, id=transcript_hash, text=transcript, media_id=media_hash)
+            
+            # Get and create Comment nodes
+            c.execute('SELECT id, message_id, text, reply_to FROM comments')
+            comments = c.fetchall()
+            
+            for comment in comments:
+                comment_id, message_id, text, reply_to = comment
+                
+                session.run("""
+                    MERGE (c:Comment {id: $comment_id})
+                    SET c.text = $text,
+                        c.reply_to = $reply_to
+                    WITH c
+                    MATCH (m:Message {id: $message_id})
+                    MERGE (m)-[:HAS_COMMENT]->(c)
+                """, comment_id=str(comment_id), text=text, reply_to=reply_to, 
+                     message_id=str(message_id))
+        
+        print(f"Successfully uploaded channel {channel_id} to Neo4j")
+        driver.close()
+        conn.close()
+        
+    except Exception as e:
+        print(f"Error uploading to Neo4j: {str(e)}")
+
+async def setup_neo4j_connection():
+    """Setup Neo4j connection details"""
+    try:
+        # Use existing credentials if available
+        neo4j_config = state.get('neo4j', {})
+        if neo4j_config.get('url') and neo4j_config.get('password'):
+            url = neo4j_config['url']
+            password = neo4j_config['password']
+            database = neo4j_config.get('database', 'neo4j')
+        else:
+            connection_type = input("Connect to Local [L] or Remote [R] Neo4j database? ").lower()
+            
+            if connection_type == 'l':
+                url = "bolt://localhost:7687"
+            else:
+                url = input("Enter Neo4j URL (e.g., bolt://example.com:7687): ")
+            
+            database = input("Enter database name (press Enter for 'neo4j'): ").strip()
+            if not database:
+                database = "neo4j"
+                
+            password = input("Enter database password: ")
+        
+        # Test connection
         driver = GraphDatabase.driver(url, auth=("neo4j", password))
-        # Verify connection
-        with driver.session(database=database) as session:
+        with driver.session() as session:
+            # Try a simple query to verify connection
             session.run("RETURN 1")
+        driver.close()
+        
+        # Save to state if new connection
+        if not neo4j_config:
+            state['neo4j'] = {
+                'type': 'local' if url == "bolt://localhost:7687" else 'remote',
+                'url': url,
+                'database': database,
+                'password': password
+            }
+            save_state(state)
+        
         print("Successfully connected to Neo4j database!")
-        return driver
+        return True
+        
     except Exception as e:
         print(f"Failed to connect to Neo4j: {str(e)}")
-        # Clear saved connection details on failure
-        if 'neo4j' in state:
-            del state['neo4j']
-            save_state(state)
-        return None
+        return False
 
-async def upload_to_neo4j(driver):
-    """Upload data to Neo4j using the provided schema"""
-    if not driver:
-        print("No valid Neo4j connection.")
-        return
-
-    try:
-        # Create constraints and indexes for better performance
-        with driver.session() as session:
-            # Create constraints
-            constraints = [
-                "CREATE CONSTRAINT user_id IF NOT EXISTS FOR (u:User) REQUIRE u.userId IS UNIQUE",
-                "CREATE CONSTRAINT channel_id IF NOT EXISTS FOR (c:Channel) REQUIRE c.channelId IS UNIQUE",
-                "CREATE CONSTRAINT message_id IF NOT EXISTS FOR (m:Message) REQUIRE (m.channelId, m.messageId) IS UNIQUE",
-                "CREATE CONSTRAINT comment_id IF NOT EXISTS FOR (c:Comment) REQUIRE c.commentId IS UNIQUE"
-            ]
-            
-            for constraint in constraints:
-                try:
-                    session.run(constraint)
-                except Exception as e:
-                    print(f"Constraint creation warning (may already exist): {e}")
-
-        # Process each channel
-        for channel_id in state['channels']:
-            channel_dir = os.path.join(os.getcwd(), str(channel_id))
-            db_file = os.path.join(channel_dir, f'{channel_id}.db')
-            
-            if not os.path.exists(db_file):
-                print(f"No database file found for channel {channel_id}")
-                continue
-
-            print(f"\nProcessing channel {channel_id}...")
-            
-            # Connect to SQLite database
-            conn = sqlite3.connect(db_file)
-            c = conn.cursor()
-            
-            # Get channel details
-            channel_details = state.get('channel_details', {}).get(channel_id, {})
-            channel_name = channel_details.get('title', str(channel_id))
-            channel_username = channel_details.get('username')
-            
-            with driver.session() as session:
-                # Create Channel node
-                session.run("""
-                    MERGE (c:Channel {channelId: $channelId})
-                    SET c.channelName = $channelName,
-                        c.username = $username
-                """, channelId=channel_id, channelName=channel_name, username=channel_username)
-                
-                # Process messages
-                c.execute('''SELECT * FROM messages''')
-                messages = c.fetchall()
-                columns = [description[0] for description in c.description]
-                
-                # Create a set to track unique users
-                unique_users = set()
-                
-                # Process each message
-                for message in messages:
-                    msg_dict = dict(zip(columns, message))
-                    
-                    # Create User node if not exists
-                    if msg_dict['sender_id']:
-                        unique_users.add((
-                            msg_dict['sender_id'],
-                            msg_dict['first_name'],
-                            msg_dict['last_name'],
-                            msg_dict['username']
-                        ))
-                    
-                    # Create Message node and relationships
-                    session.run("""
-                        MERGE (m:Message {channelId: $channelId, messageId: $messageId})
-                        SET m.timestamp = $timestamp,
-                            m.text_content = $text_content,
-                            m.media_type = $media_type,
-                            m.media_path = $media_path,
-                            m.mime_type = $mime_type
-                        WITH m
-                        MATCH (c:Channel {channelId: $channelId})
-                        MERGE (m)-[:BELONGS_TO]->(c)
-                        WITH m
-                        MATCH (u:User {userId: $userId})
-                        MERGE (u)-[:POSTED]->(m)
-                    """, channelId=channel_id, messageId=str(msg_dict['message_id']),
-                         timestamp=msg_dict['date'],
-                         text_content=msg_dict['message'],
-                         media_type=msg_dict['media_type'],
-                         media_path=msg_dict['media_path'],
-                         mime_type=msg_dict['mime_type'],
-                         userId=str(msg_dict['sender_id']) if msg_dict['sender_id'] else None)
-                
-                # Create all unique User nodes
-                for user in unique_users:
-                    session.run("""
-                        MERGE (u:User {userId: $userId})
-                        SET u.first_name = $firstName,
-                            u.last_name = $lastName,
-                            u.username = $username
-                        WITH u
-                        MATCH (c:Channel {channelId: $channelId})
-                        MERGE (u)-[:BELONGS_TO]->(c)
-                    """, userId=str(user[0]),
-                         firstName=user[1],
-                         lastName=user[2],
-                         username=user[3],
-                         channelId=channel_id)
-                
-                # Process comments
-                c.execute('''SELECT * FROM comments''')
-                comments = c.fetchall()
-                comment_columns = [description[0] for description in c.description]
-                
-                # Process each comment
-                for comment in comments:
-                    comment_dict = dict(zip(comment_columns, comment))
-                    
-                    # Create Comment node and relationships
-                    session.run("""
-                        MERGE (c:Comment {commentId: $commentId})
-                        SET c.timestamp = $timestamp,
-                            c.text_content = $text_content
-                        WITH c
-                        MATCH (m:Message {channelId: $channelId, messageId: $messageId})
-                        MERGE (c)-[:REPLIES_TO]->(m)
-                        WITH c
-                        MATCH (u:User {userId: $userId})
-                        MERGE (u)-[:COMMENTED]->(c)
-                        WITH c
-                        MATCH (ch:Channel {channelId: $channelId})
-                        MERGE (c)-[:BELONGS_TO]->(ch)
-                    """, commentId=str(comment_dict['comment_id']),
-                         timestamp=comment_dict['date'],
-                         text_content=comment_dict['comment_text'],
-                         channelId=channel_id, messageId=str(comment_dict['message_id']),
-                         userId=str(comment_dict['sender_id']) if comment_dict['sender_id'] else None)
-            
-            conn.close()
-            print(f"Completed processing channel {channel_id}")
-        
-        print("\nNeo4j upload completed successfully!")
-        
-    except Exception as e:
-        print(f"Error during Neo4j upload: {e}")
-        raise
-
-def get_media_files(channel_id):
+async def get_media_files(channel_id):
     """Get all media files for a channel that haven't been transcribed"""
     channel_dir = os.path.join(os.getcwd(), str(channel_id))
     media_dir = os.path.join(channel_dir, 'media')
@@ -976,6 +959,12 @@ def get_media_files(channel_id):
     all_media = c.fetchall()
     print(f"Total media files in database: {len(all_media)}")
     
+    # List all files in media directory
+    media_files = set(os.listdir(media_dir))
+    print(f"Files in media directory: {len(media_files)}")
+    for file in media_files:
+        print(f"Found file: {file}")
+    
     # Query for audio/video content based on media_type or mime_type
     c.execute('''
         SELECT media_path, media_type, mime_type
@@ -996,24 +985,59 @@ def get_media_files(channel_id):
     files_to_process = []
     for row in c.fetchall():
         media_path, media_type, mime_type = row
-        full_path = os.path.join(media_dir, media_path)
-        if os.path.exists(full_path):
-            files_to_process.append(media_path)
-            print(f"Found file to transcribe: {media_path} (Type: {media_type}, MIME: {mime_type})")
+        # Use just the filename from media_path
+        media_filename = os.path.basename(media_path)
+        if media_filename in media_files:
+            files_to_process.append(media_filename)
+            print(f"Found file to transcribe: {media_filename} (Type: {media_type}, MIME: {mime_type})")
         else:
-            print(f"File not found: {media_path}")
+            print(f"File not found in media directory: {media_filename}")
     
     conn.close()
     
     return files_to_process
 
+def extract_audio(video_path, output_path):
+    """Extract audio from video using imageio-ffmpeg"""
+    import subprocess
+    
+    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    
+    # Build the ffmpeg command
+    cmd = [
+        ffmpeg_path,
+        '-i', video_path,  # Input
+        '-vn',  # No video
+        '-acodec', 'pcm_s16le',  # Audio codec
+        '-ar', '16000',  # Sample rate
+        '-ac', '1',  # Mono
+        '-y',  # Overwrite output
+        output_path
+    ]
+    
+    # Run the command
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    stdout, stderr = process.communicate()
+    
+    if process.returncode != 0:
+        error_msg = stderr.decode() if stderr else "Unknown error"
+        raise Exception(f"FFmpeg failed with return code {process.returncode}: {error_msg}")
+    
+    if not os.path.exists(output_path):
+        raise Exception(f"FFmpeg did not create output file: {output_path}")
+    
+    return output_path
+
 async def transcribe_media(channel_id):
-    """Transcribe audio and video files for a channel"""
     try:
         print(f"\nInitializing Whisper model ({state['whisper_model']})...")
         model = whisper.load_model(state['whisper_model'])
         
-        files = get_media_files(channel_id)
+        files = await get_media_files(channel_id)
         if not files:
             print("No new media files to transcribe.")
             return
@@ -1021,40 +1045,92 @@ async def transcribe_media(channel_id):
         print(f"Found {len(files)} files to transcribe.")
         channel_dir = os.path.join(os.getcwd(), str(channel_id))
         media_dir = os.path.join(channel_dir, 'media')
+        temp_dir = os.path.join(channel_dir, 'temp')
+        os.makedirs(temp_dir, exist_ok=True)
         
         # Connect to database
         db_file = os.path.join(channel_dir, f'{channel_id}.db')
         conn = sqlite3.connect(db_file)
         c = conn.cursor()
         
-        for i, media_path in enumerate(files, 1):
-            full_path = os.path.join(media_dir, media_path)
-            print(f"\nProcessing file {i}/{len(files)}: {media_path}")
-            
+        for i, media_filename in enumerate(files, 1):
             try:
-                # Transcribe the file
-                result = model.transcribe(full_path)
-                transcript = result["text"].strip()
+                video_path = os.path.join(media_dir, media_filename)
+                print(f"\nProcessing file {i}/{len(files)}: {media_filename}")
                 
-                # Update database with transcript
-                c.execute('''
-                    UPDATE messages 
-                    SET transcript = ? 
-                    WHERE media_path = ?
-                ''', (transcript, media_path))
-                conn.commit()
+                # Extra path verification
+                if not os.path.exists(video_path):
+                    print(f"Video file does not exist: {video_path}")
+                    continue
+                    
+                if not os.path.isfile(video_path):
+                    print(f"Not a file: {video_path}")
+                    continue
                 
-                print(f"Transcription successful: {len(transcript)} characters")
+                try:
+                    # Extract audio to temp WAV file
+                    audio_filename = os.path.splitext(media_filename)[0] + '.wav'
+                    audio_path = os.path.join(temp_dir, audio_filename)
+                    print(f"Extracting audio...")
+                    
+                    extract_audio(video_path, audio_path)
+                    
+                    # Load and transcribe the audio
+                    print("Loading audio...")
+                    audio_data, sample_rate = sf.read(audio_path)
+                    audio_data = audio_data.astype(np.float32)
+                    
+                    if sample_rate != 16000:
+                        audio_data = whisper.pad_or_trim(audio_data)
+                    
+                    print("Transcribing audio...")
+                    result = model.transcribe(audio_data, fp16=False)
+                    transcript = result["text"].strip()
+                    
+                    # Update database with transcript
+                    c.execute('''
+                        UPDATE messages 
+                        SET transcript = ? 
+                        WHERE media_path LIKE ?
+                    ''', (transcript, f'%{media_filename}'))
+                    conn.commit()
+                    
+                    print(f"Transcription successful: {len(transcript)} characters")
+                    print(f"Transcript preview: {transcript[:200]}..." if len(transcript) > 200 else f"Transcript: {transcript}")
+                    
+                    # Clean up temp file
+                    try:
+                        os.remove(audio_path)
+                    except Exception as e:
+                        print(f"Warning: Could not remove temp file {audio_path}: {e}")
+                except Exception as e:
+                    print(f"Error during transcription:")
+                    print(f"Error type: {type(e).__name__}")
+                    print(f"Error message: {str(e)}")
+                    print(f"Full error: {sys.exc_info()}")
+                    continue
                 
             except Exception as e:
-                print(f"Error transcribing {media_path}: {e}")
+                print(f"Error processing {media_filename}:")
+                print(f"Error type: {type(e).__name__}")
+                print(f"Error message: {str(e)}")
+                print(f"Full error: {sys.exc_info()}")
                 continue
         
         conn.close()
         print("\nTranscription complete!")
         
+        # Clean up temp directory
+        try:
+            import shutil
+            shutil.rmtree(temp_dir)
+        except Exception as e:
+            print(f"Warning: Could not remove temp directory {temp_dir}: {e}")
+        
     except Exception as e:
-        print(f"Error during transcription: {e}")
+        print(f"Error during transcription process:")
+        print(f"Error type: {type(e).__name__}")
+        print(f"Error message: {str(e)}")
 
 WHISPER_MODELS = {
     'tiny': 'Fastest, lowest accuracy',

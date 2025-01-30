@@ -1,7 +1,7 @@
 telethon
-aiohttp
 asyncio
 python-dotenv
 neo4j
+imageio-ffmpeg
 openai-whisper
-ffmpeg-python
+soundfile
