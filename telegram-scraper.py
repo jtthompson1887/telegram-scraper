@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import csv
 import sqlite3
 import asyncio
 import whisper
@@ -389,16 +390,32 @@ async def continuous_scraping():
     global continuous_scraping_active
     continuous_scraping_active = True
 
+    print("\nStarting continuous scraping mode...")
+    print("Press Ctrl+C to stop scraping and return to menu")
+    print("=" * 50)
+
     try:
         while continuous_scraping_active:
             for channel in state['channels']:
+                if not continuous_scraping_active:
+                    break
                 print(f"\nChecking for new messages in channel: {channel}")
-                await scrape_channel(channel, state['channels'][channel])
-                print(f"New messages or media scraped from channel: {channel}")
-            await asyncio.sleep(60)
-    except asyncio.CancelledError:
-        print("Continuous scraping stopped.")
+                try:
+                    await scrape_channel(channel, state['channels'][channel])
+                    print(f"New messages or media scraped from channel: {channel}")
+                except Exception as e:
+                    print(f"Error scraping channel {channel}: {e}")
+                    continue
+            
+            print("\nWaiting 60 seconds before next check... (Press Ctrl+C to stop)")
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                raise
+    except (asyncio.CancelledError, KeyboardInterrupt):
         continuous_scraping_active = False
+        print("\nStopping continuous scraping...")
+        print("Returning to menu...")
 
 async def export_data():
     for channel in state['channels']:
@@ -420,30 +437,34 @@ async def export_to_csv(channel_id):
         conn = sqlite3.connect(db_file)
         c = conn.cursor()
         
-        # Export messages
-        output_file = os.path.join(channel_dir, f'{channel_id}_messages.csv')
-        c.execute('''SELECT message_id, date, message, media_type, media_path, mime_type, transcript
-                    FROM messages''')
-        
-        with open(output_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(['Message ID', 'Date', 'Message', 'Media Type', 'Media Path', 'MIME Type', 'Transcript'])
-            writer.writerows(c.fetchall())
-        
-        print(f"Messages exported to {output_file}")
-        
-        # Export comments
-        output_file = os.path.join(channel_dir, f'{channel_id}_comments.csv')
-        c.execute('SELECT * FROM comments')
-        
-        with open(output_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow([description[0] for description in c.description])
-            writer.writerows(c.fetchall())
-        
-        print(f"Comments exported to {output_file}")
-        conn.close()
-        
+        try:
+            # Export messages
+            output_file = os.path.join(channel_dir, f'{channel_id}_messages.csv')
+            c.execute('''SELECT message_id, date, message, media_type, media_path, mime_type, transcript
+                        FROM messages''')
+            
+            with open(output_file, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Message ID', 'Date', 'Message', 'Media Type', 'Media Path', 'MIME Type', 'Transcript'])
+                writer.writerows(c.fetchall())
+            
+            print(f"Messages exported to {output_file}")
+            
+            # Export comments
+            output_file = os.path.join(channel_dir, f'{channel_id}_comments.csv')
+            c.execute('SELECT * FROM comments')
+            
+            with open(output_file, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([description[0] for description in c.description])
+                writer.writerows(c.fetchall())
+            
+            print(f"Comments exported to {output_file}")
+        except Exception as e:
+            print(f"Error writing CSV file: {str(e)}")
+        finally:
+            conn.close()
+            
     except Exception as e:
         print(f"Error exporting to CSV: {str(e)}")
 
@@ -756,36 +777,78 @@ async def upload_to_neo4j(channel_id):
         c = conn.cursor()
         
         with driver.session() as session:
-            # Create Channel node
+            # Create full-text search indexes if they don't exist
+            try:
+                # Create index for Message nodes
+                session.run("""
+                    CREATE FULLTEXT INDEX message_content IF NOT EXISTS
+                    FOR (n:Message)
+                    ON EACH [n.message]
+                """)
+                
+                # Create index for Comment nodes
+                session.run("""
+                    CREATE FULLTEXT INDEX comment_content IF NOT EXISTS
+                    FOR (n:Comment)
+                    ON EACH [n.text]
+                """)
+
+                # Create index for Transcript nodes
+                session.run("""
+                    CREATE FULLTEXT INDEX transcript_content IF NOT EXISTS
+                    FOR (n:Transcript)
+                    ON EACH [n.transcript]
+                """)
+            except Exception as e:
+                print(f"Warning: Could not create full-text indexes: {str(e)}")
+            
+            # Get channel name from state
+            channel_name = state.get('channel_details', {}).get(str(channel_id), {}).get('title', str(channel_id))
+            
+            # Create Channel node with name
             session.run("""
                 MERGE (c:Channel {id: $channel_id})
-                SET c.channel_id = $channel_id
-            """, channel_id=str(channel_id))
-            
-            # Get table structure
-            c.execute("PRAGMA table_info(messages)")
-            columns = [col[1] for col in c.fetchall()]
-            print("Available columns:", columns)
+                SET c.channel_id = $channel_id,
+                    c.name = $channel_name
+            """, channel_id=str(channel_id), channel_name=channel_name)
             
             # Get and create Message nodes with Media and Transcript relationships
-            c.execute('''SELECT message_id, date, message, media_type, media_path, mime_type, transcript 
+            c.execute('''SELECT message_id, date, message, media_type, media_path, mime_type, transcript, reply_to,
+                               sender_id, first_name, last_name, username 
                         FROM messages''')
             messages = c.fetchall()
             
             for msg in messages:
-                msg_id, date, message_text, media_type, media_path, mime_type, transcript = msg
+                (msg_id, date, message_text, media_type, media_path, mime_type, transcript, reply_to,
+                 sender_id, first_name, last_name, username) = msg
                 
-                # Create Message node
+                # Skip messages without text content (like channel creation messages)
+                if not message_text and not media_path:
+                    continue
+
+                # Create display name for sender
+                sender_name = ' '.join(filter(None, [first_name, last_name])) if first_name or last_name else username or str(sender_id)
+                
+                # Create preview text (truncate at 50 chars)
+                preview_text = (message_text[:47] + "...") if message_text and len(message_text) > 50 else message_text
+                
+                # Create Message node with sender info and preview
                 session.run("""
                     MERGE (m:Message {id: $msg_id})
                     SET m.date = $date,
-                        m.text = $message_text
+                        m.message = $message_text,
+                        m.preview = $preview_text,
+                        m.reply_to = $reply_to,
+                        m.sender_name = $sender_name,
+                        m.username = $username
                     WITH m
                     MATCH (c:Channel {id: $channel_id})
                     MERGE (c)-[:HAS_MESSAGE]->(m)
-                """, msg_id=str(msg_id), date=date, message_text=message_text, channel_id=str(channel_id))
+                """, msg_id=str(msg_id), date=date, message_text=message_text, preview_text=preview_text,
+                     reply_to=str(reply_to) if reply_to else None, channel_id=str(channel_id),
+                     sender_name=sender_name, username=username)
                 
-                # If there's media, create Media node
+                # If there's media, create Media node with better labels
                 if media_path:
                     # Create hash from media path for unique ID
                     import hashlib
@@ -795,12 +858,16 @@ async def upload_to_neo4j(channel_id):
                     abs_path = os.path.abspath(os.path.join(channel_dir, 'media', media_path))
                     file_url = f"file:///{abs_path.replace(os.sep, '/')}"
                     
+                    # Get filename for label
+                    filename = os.path.basename(media_path)
+                    
                     # Create Media node with appropriate properties
                     media_props = {
                         'id': media_hash,
                         'type': media_type,
                         'mime_type': mime_type,
-                        'path': media_path
+                        'path': media_path,
+                        'filename': filename
                     }
                     
                     # Add thumbnail for images
@@ -815,34 +882,45 @@ async def upload_to_neo4j(channel_id):
                         MERGE (m)-[:HAS_MEDIA]->(media)
                     """, id=media_hash, props=media_props, msg_id=str(msg_id))
                     
-                    # If there's a transcript, create Transcript node
+                    # If there's a transcript, create Transcript node with preview
                     if transcript:
                         transcript_hash = hashlib.md5(f"{media_hash}_transcript".encode()).hexdigest()
+                        transcript_preview = (transcript[:47] + "...") if len(transcript) > 50 else transcript
                         
                         session.run("""
                             MERGE (t:Transcript {id: $id})
-                            SET t.text = $text
+                            SET t.transcript = $transcript,
+                                t.preview = $preview
                             WITH t
                             MATCH (media:Media {id: $media_id})
                             MERGE (media)-[:HAS_TRANSCRIPT]->(t)
-                        """, id=transcript_hash, text=transcript, media_id=media_hash)
+                        """, id=transcript_hash, transcript=transcript, preview=transcript_preview, media_id=media_hash)
             
-            # Get and create Comment nodes
-            c.execute('SELECT id, message_id, text, reply_to FROM comments')
+            # Get and create Comment nodes with sender info and preview
+            c.execute('''SELECT comment_id, message_id, comment_text, sender_id, first_name, last_name, username 
+                        FROM comments''')
             comments = c.fetchall()
             
             for comment in comments:
-                comment_id, message_id, text, reply_to = comment
+                comment_id, message_id, comment_text, sender_id, first_name, last_name, username = comment
+                
+                # Create display name for commenter
+                sender_name = ' '.join(filter(None, [first_name, last_name])) if first_name or last_name else username or str(sender_id)
+                
+                # Create preview text
+                preview_text = (comment_text[:47] + "...") if comment_text and len(comment_text) > 50 else comment_text
                 
                 session.run("""
                     MERGE (c:Comment {id: $comment_id})
-                    SET c.text = $text,
-                        c.reply_to = $reply_to
+                    SET c.text = $comment_text,
+                        c.preview = $preview_text,
+                        c.sender_name = $sender_name,
+                        c.username = $username
                     WITH c
                     MATCH (m:Message {id: $message_id})
                     MERGE (m)-[:HAS_COMMENT]->(c)
-                """, comment_id=str(comment_id), text=text, reply_to=reply_to, 
-                     message_id=str(message_id))
+                """, comment_id=str(comment_id), comment_text=comment_text, preview_text=preview_text,
+                     sender_name=sender_name, username=username, message_id=str(message_id))
         
         print(f"Successfully uploaded channel {channel_id} to Neo4j")
         driver.close()
@@ -1240,7 +1318,13 @@ async def reset_menu():
 
 async def main():
     await client.start()
-    await main_menu()
+    try:
+        await main_menu()
+    except KeyboardInterrupt:
+        print("\nGracefully shutting down...")
+        # Ensure continuous scraping is stopped
+        global continuous_scraping_active
+        continuous_scraping_active = False
 
 if __name__ == '__main__':
     try:
