@@ -5,3 +5,4 @@ neo4j
 imageio-ffmpeg
 openai-whisper
 soundfile
+pyinstaller

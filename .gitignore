@@ -12,6 +12,11 @@ __pycache__/
 *.db
 *.sqlite3
 
+# Build Artifacts
+build/*
+dist/*
+
 # Project specific
 state.json
 session.session
+[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]/
